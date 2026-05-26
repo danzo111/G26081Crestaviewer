@@ -418,6 +418,7 @@ export class GeometryBuilder {
     );
     basemapPlane.name = 'basemap';
     basemapPlane.receiveShadow = true;
+    basemapPlane.renderOrder = -100;  // Draw behind all map elements
     this.scene.add(basemapPlane);
 
     const grid = this.scene.getObjectByName('ground_grid');
