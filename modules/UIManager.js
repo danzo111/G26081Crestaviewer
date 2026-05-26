@@ -141,15 +141,47 @@ export class UIManager {
   }
 
   // ── Popup ──────────────────────────────────────────────────
-  showPopup() {
+  showPopup(screenPos = null) {
     if (!this.elements.popup) {
       console.error('showPopup: popup element not found');
       return;
     }
     this.elements.popup.classList.add('visible');
-    this.elements.popup.style.left = '20px';
-    this.elements.popup.style.top = '60px';
     this.elements.popup.style.pointerEvents = 'auto';
+
+    if (screenPos) {
+      // Position near the clicked manhole, keeping within viewport bounds
+      const popupW = 300;
+      const popupH = 400;
+      const margin = 16;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+
+      let left = screenPos.x + 20;
+      let top = screenPos.y - 40;
+
+      // Keep inside right edge
+      if (left + popupW > vw - margin) {
+        left = screenPos.x - popupW - 20;
+      }
+      // Keep inside bottom edge
+      if (top + popupH > vh - margin) {
+        top = vh - popupH - margin;
+      }
+      // Keep inside top edge
+      if (top < margin) top = margin;
+      // Keep inside left edge
+      if (left < margin) left = margin;
+
+      this.elements.popup.style.left = `${left}px`;
+      this.elements.popup.style.right = 'auto';
+      this.elements.popup.style.top = `${top}px`;
+    } else {
+      // Fallback: right side
+      this.elements.popup.style.left = 'auto';
+      this.elements.popup.style.right = '20px';
+      this.elements.popup.style.top = '60px';
+    }
   }
 
   hidePopup() {
@@ -159,7 +191,7 @@ export class UIManager {
     }
   }
 
-  renderManholePopup(mh) {
+  renderManholePopup(mh, traceInfo = null, screenPos = null) {
     if (!this.elements.popupType || !this.elements.popupTitle || !this.elements.popupBody) {
       console.error('renderManholePopup: missing popup elements');
       return;
@@ -183,13 +215,35 @@ export class UIManager {
       html += this._buildImageGallery(mh.images, mh.name);
     }
 
+    // Network trace legend — explains what green/red means
+    if (traceInfo) {
+      html += `
+        <div class="trace-legend">
+          <div class="trace-legend-title">⬡ Network Trace</div>
+          <div class="trace-legend-row">
+            <span class="trace-dot up"></span>
+            <span class="trace-text"><strong>Upstream</strong> — water flows TO this manhole</span>
+            <span class="trace-count">${traceInfo.upstreamCount} MH · ${traceInfo.upstreamPipeCount} pipes</span>
+          </div>
+          <div class="trace-legend-row">
+            <span class="trace-dot down"></span>
+            <span class="trace-text"><strong>Downstream</strong> — water flows FROM this manhole</span>
+            <span class="trace-count">${traceInfo.downstreamCount} MH · ${traceInfo.downstreamPipeCount} pipes</span>
+          </div>
+          <div class="trace-legend-note">
+            💡 <em>Green = where water comes from · Red = where water goes</em>
+          </div>
+        </div>
+      `;
+    }
+
     this.elements.popupBody.innerHTML = html;
-    this.showPopup();
+    this.showPopup(screenPos);
 
     requestAnimationFrame(() => this._attachGalleryListeners());
   }
 
-  renderPipePopup(pd, onProfileClick) {
+  renderPipePopup(pd, onProfileClick, screenPos = null) {
     if (!this.elements.popupType || !this.elements.popupTitle || !this.elements.popupBody) {
       console.error('renderPipePopup: missing popup elements');
       return;
@@ -213,7 +267,7 @@ export class UIManager {
     html += `<button class="profile-btn" id="profile-btn">📊 &nbsp;ELEVATION PROFILE</button>`;
 
     this.elements.popupBody.innerHTML = html;
-    this.showPopup();
+    this.showPopup(screenPos);
 
     requestAnimationFrame(() => {
       const btn = document.getElementById('profile-btn');
