@@ -414,7 +414,7 @@ input, select { font-family: inherit; }
   top: 60px;
   left: 20px;
   z-index: 40;
-  width: 260px;
+  width: 320px;
   pointer-events: none;
   opacity: 0;
   transform: translateY(-6px);
@@ -445,10 +445,10 @@ input, select { font-family: inherit; }
 
 .type-tag {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 11px;
   letter-spacing: 2px;
   text-transform: uppercase;
-  padding: 3px 8px;
+  padding: 4px 10px;
   border-radius: 2px;
   font-weight: 700;
 }
@@ -475,17 +475,17 @@ input, select { font-family: inherit; }
 .popup-close:hover { color: var(--text); }
 
 .popup-title {
-  padding: 10px 14px 6px;
+  padding: 12px 16px 8px;
   font-family: var(--serif);
-  font-size: 15px;
+  font-size: 20px;
   font-weight: 700;
   color: var(--text);
   border-bottom: 1px solid var(--border-faint);
 }
 
 .popup-body {
-  padding: 8px 0;
-  max-height: 360px;
+  padding: 10px 0;
+  max-height: 450px;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--border-mid) transparent;
@@ -497,15 +497,15 @@ input, select { font-family: inherit; }
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  padding: 5px 14px;
+  padding: 7px 16px;
   border-bottom: 1px solid var(--border-faint);
-  gap: 8px;
+  gap: 10px;
 }
 .popup-row:last-child { border-bottom: none; }
 
 .popup-label {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 11px;
   letter-spacing: 0.5px;
   color: var(--text-faint);
   text-transform: uppercase;
@@ -514,7 +514,7 @@ input, select { font-family: inherit; }
 
 .popup-value {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 14px;
   color: var(--text);
   text-align: right;
   word-break: break-all;
@@ -1591,4 +1591,317 @@ body.measure-active #viewport { cursor: crosshair; }
 /* ── Reduced motion preference ────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   NetView 3D — Map View Styles
+   Simple 2D map interface for non-technical users
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── View Mode Toggle Button ──────────────────────────────────────── */
+.view-mode-toggle {
+  padding: 6px 14px;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  color: var(--white);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-right: 12px;
+}
+.view-mode-toggle:hover {
+  background: var(--accent-lt);
+  border-color: var(--accent-lt);
+}
+
+/* ── Map Controls Panel ───────────────────────────────────────────── */
+#map-controls {
+  position: fixed;
+  top: 56px;
+  left: 10px;
+  z-index: 30;
+  width: 220px;
+  background: var(--mid);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  padding: 14px;
+  display: none;
+  flex-direction: column;
+  gap: 14px;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+}
+#map-controls.visible {
+  display: flex;
+}
+
+/* ── Map Search ───────────────────────────────────────────────────── */
+.map-search {
+  display: flex;
+  gap: 6px;
+}
+.map-search input {
+  flex: 1;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--dark);
+  outline: none;
+}
+.map-search input::placeholder { color: var(--text-faint); }
+.map-search input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+.map-search button {
+  padding: 7px 10px;
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius);
+  color: var(--white);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.map-search button:hover { background: var(--accent-lt); }
+
+/* ── Map Legend ───────────────────────────────────────────────────── */
+.map-legend-title {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 2.5px;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 8px;
+  font-weight: 700;
+}
+
+.map-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 7px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.map-legend-item:last-child { margin-bottom: 0; }
+
+.map-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  border: 2px solid var(--white);
+}
+.map-dot.sewer { background: var(--accent); }
+.map-dot.storm { background: var(--storm); }
+
+.map-line {
+  width: 20px;
+  height: 4px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+.map-line.sewer { background: var(--accent); }
+.map-line.storm { background: #4A90D9; }
+
+.map-arrow {
+  width: 0;
+  height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 10px solid #00aaff;
+  flex-shrink: 0;
+}
+
+.map-ring {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 3px solid;
+  flex-shrink: 0;
+  background: transparent;
+}
+.map-ring.up { border-color: var(--success); }
+.map-ring.down { border-color: var(--danger); }
+
+/* ── Map Layers ───────────────────────────────────────────────────── */
+.map-layer-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.map-layer-item:last-child { margin-bottom: 0; }
+.map-layer-item input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* ── Map Hint ─────────────────────────────────────────────────────── */
+.map-hint {
+  padding: 10px;
+  background: var(--dark);
+  border: 1px solid var(--border-mid);
+  border-radius: var(--radius);
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.map-hint strong {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ── Map Mode Viewport ────────────────────────────────────────────── */
+#viewport.map-mode {
+  cursor: grab;
+}
+#viewport.map-mode:active {
+  cursor: grabbing;
+}
+
+/* ── Hide 3D UI in map mode ───────────────────────────────────────── */
+#control-panel.hidden,
+#view-buttons.hidden,
+#data-toggle.hidden {
+  display: none !important;
+}
+
+/* ── Popup enhancements for Map View ──────────────────────────────── */
+#popup.map-popup {
+  position: fixed;
+  top: 56px;
+  right: 20px;
+  left: auto;
+  z-index: 40;
+}
+
+/* ── Network trace info in popup ──────────────────────────────────── */
+.trace-info {
+  margin: 8px 14px;
+  padding: 8px;
+  background: var(--dark);
+  border: 1px solid var(--border-mid);
+  border-radius: var(--radius);
+}
+.trace-info-title {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+.trace-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  margin-bottom: 3px;
+}
+.trace-row:last-child { margin-bottom: 0; }
+.trace-label { color: var(--text-faint); }
+.trace-value { color: var(--text); font-family: var(--mono); }
+.trace-value.up { color: var(--success); }
+.trace-value.down { color: var(--danger); }
+
+/* ── Responsive ───────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  #map-controls {
+    width: calc(100vw - 20px);
+    left: 10px;
+    right: 10px;
+  }
+}
+
+
+/* ── Network Trace Legend in Popup ───────────────────────────────── */
+.trace-legend {
+  margin: 10px 14px 6px;
+  padding: 12px;
+  background: var(--dark);
+  border: 1px solid var(--border-mid);
+  border-radius: var(--radius);
+}
+.trace-legend-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 10px;
+  font-weight: 700;
+}
+.trace-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+.trace-legend-row:last-child {
+  margin-bottom: 0;
+}
+.trace-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  border: 2px solid rgba(255,255,255,0.5);
+}
+.trace-dot.up {
+  background: var(--success);
+}
+.trace-dot.down {
+  background: var(--danger);
+}
+.trace-text {
+  color: var(--text);
+  flex: 1;
+  line-height: 1.4;
+}
+.trace-text strong {
+  color: var(--text);
+}
+.trace-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.trace-legend-note {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-faint);
+  font-size: 11px;
+  color: var(--text-dim);
+  font-style: italic;
+  line-height: 1.4;
+}
+
+/* ── Hide 3D Control Panel in Map Mode ───────────────────────────── */
+#control-panel.hidden {
+  display: none !important;
+}
+
+/* ── Popup right-side positioning ─────────────────────────────────── */
+#popup {
+  left: auto !important;
+  right: 20px;
 }
