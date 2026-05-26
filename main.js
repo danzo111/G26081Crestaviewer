@@ -1,11 +1,18 @@
 /**
- * main.js — Network Viewer Application Entry Point
+ * main.js — Network Viewer: Map View + 3D View
  * 
- * Features:
- * - Search & filter manholes by ID, name, type
- * - Flow direction arrows (higher invert → lower invert)
- * - Sortable data table with virtual scrolling
- * - Keyboard shortcuts: T (table), F (flow), M (measure), 1-6 (views)
+ * Two modes:
+ *   - MAP VIEW: Simple 2D top-down for mall managers
+ *   - 3D VIEW: Full technical 3D for engineers
+ * 
+ * Map View features:
+ *   - Aerial basemap with overlaid pipes and manholes
+ *   - Clickable manhole dots with ID labels
+ *   - Flow direction arrows
+ *   - Upstream/downstream network highlighting
+ *   - Search by manhole ID
+ *   - Popup with photos and all technical data
+ *   - Minimal UI: legend, layer toggles, view toggle
  */
 
 import * as THREE from 'three';
@@ -34,8 +41,24 @@ class NetworkViewerApp {
     this.flowArrows = null;
     this.dataTable = null;
     this.helpModal = null;
-    this._searchDebounceTimer = null;
 
+    // Map View state
+    this.mapMode = false;
+    this.mapCamera = null;
+    this.mapControls = null;
+    this.mapManholeSprites = [];
+    this.mapPipeLines = [];
+    this.mapFlowArrows = [];
+    this.mapUpstreamHighlights = [];
+    this.mapDownstreamHighlights = [];
+    this.mapSelectedManhole = null;
+
+    // Network graph for tracing
+    this.outgoingGraph = new Map();
+    this.incomingGraph = new Map();
+    this.pipeByEndpoints = new Map();
+
+    this._searchDebounceTimer = null;
     this._bindMethods();
   }
 
@@ -66,6 +89,10 @@ class NetworkViewerApp {
       await this._yieldFrame();
       this.searchIndex = new SearchIndex(networkData, this.coordSystem);
 
+      this.ui.setProgress(35, 'Building network graph...');
+      await this._yieldFrame();
+      this._buildNetworkGraph(networkData);
+
       this.ui.setProgress(40, 'Building geometry...');
       await this._yieldFrame();
       this.geometryBuilder = new GeometryBuilder(this.sceneManager, this.coordSystem);
@@ -73,7 +100,6 @@ class NetworkViewerApp {
       const mhResult = this.geometryBuilder.buildManholes(networkData.manholes);
       const pipeResult = this.geometryBuilder.buildPipes(networkData.pipes, appState.mhLookup);
 
-      // Flow arrows (uses appState.pipeData set inside buildPipes)
       this.flowArrows = new FlowArrows(
         this.sceneManager.scene,
         appState.pipeData,
@@ -85,6 +111,10 @@ class NetworkViewerApp {
       this.groundObjects = this.geometryBuilder.buildGround();
       this.geometryBuilder.buildDropLines(networkData.manholes);
       await this._loadBasemap();
+
+      this.ui.setProgress(70, 'Building Map View...');
+      await this._yieldFrame();
+      this._buildMapView(networkData);
 
       this.ui.setProgress(80, 'Setting up interactions...');
       await this._yieldFrame();
@@ -99,6 +129,7 @@ class NetworkViewerApp {
       this._setupUIControls();
       this._setupSearchAndTable();
       this._setupFlowToggle();
+      this._setupViewToggle();
       this._setupHelpModal();
 
       this.ui.setProgress(90, 'Framing scene...');
@@ -106,16 +137,864 @@ class NetworkViewerApp {
       const box = this.coordSystem.computeBoundingBox(networkData.manholes);
       this.sceneManager.frameCamera(box, 0.5);
 
+      // Set up map camera position
+      this._setupMapCamera(box);
+
       this.ui.setProgress(100, 'Ready');
       await this._yieldFrame();
       await this._yieldFrame();
       this.ui.hideLoading();
+
+      // Start in Map View by default
+      this._toggleMapMode();
+
       this._animate();
 
     } catch (error) {
       this._handleFatalError(error);
     }
   }
+
+  /**
+   * Build directed network graph for upstream/downstream tracing.
+   * Flow direction: higher invert → lower invert.
+   */
+  _buildNetworkGraph(networkData) {
+    const { manholes, pipes } = networkData;
+    const mhLookup = {};
+    manholes.forEach(m => mhLookup[m.id] = m);
+
+    pipes.forEach((p, i) => {
+      const fromMH = mhLookup[p.from_mh];
+      const toMH = mhLookup[p.to_mh];
+      if (!fromMH || !toMH) return;
+
+      const fromInvert = fromMH.cover_elev - p.from_depth;
+      const toInvert = toMH.cover_elev - p.to_depth;
+
+      let flowFrom, flowTo;
+      if (fromInvert >= toInvert) {
+        flowFrom = p.from_mh;
+        flowTo = p.to_mh;
+      } else {
+        flowFrom = p.to_mh;
+        flowTo = p.from_mh;
+      }
+
+      if (!this.outgoingGraph.has(flowFrom)) this.outgoingGraph.set(flowFrom, []);
+      if (!this.incomingGraph.has(flowTo)) this.incomingGraph.set(flowTo, []);
+
+      this.outgoingGraph.get(flowFrom).push({ to: flowTo, pipeIndex: i });
+      this.incomingGraph.get(flowTo).push({ from: flowFrom, pipeIndex: i });
+
+      // Store pipe by sorted endpoint pair for quick lookup
+      const key = [flowFrom, flowTo].sort().join('::');
+      this.pipeByEndpoints.set(key, i);
+    });
+  }
+
+  /**
+   * Trace upstream network from a manhole ID.
+   * Returns { manholeIds: Set, pipeIndices: Set }
+   */
+  _traceUpstream(manholeId) {
+    const manholeIds = new Set();
+    const pipeIndices = new Set();
+    const queue = [manholeId];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (manholeIds.has(current)) continue;
+      manholeIds.add(current);
+
+      const incoming = this.incomingGraph.get(current) || [];
+      for (const { from, pipeIndex } of incoming) {
+        pipeIndices.add(pipeIndex);
+        if (!manholeIds.has(from)) {
+          queue.push(from);
+        }
+      }
+    }
+
+    return { manholeIds, pipeIndices };
+  }
+
+  /**
+   * Trace downstream network from a manhole ID.
+   * Returns { manholeIds: Set, pipeIndices: Set }
+   */
+  _traceDownstream(manholeId) {
+    const manholeIds = new Set();
+    const pipeIndices = new Set();
+    const queue = [manholeId];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (manholeIds.has(current)) continue;
+      manholeIds.add(current);
+
+      const outgoing = this.outgoingGraph.get(current) || [];
+      for (const { to, pipeIndex } of outgoing) {
+        pipeIndices.add(pipeIndex);
+        if (!manholeIds.has(to)) {
+          queue.push(to);
+        }
+      }
+    }
+
+    return { manholeIds, pipeIndices };
+  }
+
+  _buildMapView(networkData) {
+    const scene = this.sceneManager.scene;
+    const { manholes, pipes } = networkData;
+
+    // ── Manhole dots with labels ──
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = 256;
+    canvas.height = 128;
+
+    manholes.forEach((mh, i) => {
+      const pos = this.coordSystem.w2s(mh.x, mh.y, mh.cover_elev);
+
+      // Create sprite for manhole dot
+      const dotCanvas = document.createElement('canvas');
+      const dotCtx = dotCanvas.getContext('2d');
+      dotCanvas.width = 128;
+      dotCanvas.height = 128;
+
+      const isSewer = mh.type === 'Sewer';
+      const color = isSewer ? '#E87722' : '#00D4FF';
+
+      // Outer glow
+      dotCtx.beginPath();
+      dotCtx.arc(64, 64, 44, 0, Math.PI * 2);
+      dotCtx.fillStyle = isSewer ? 'rgba(232,119,34,0.25)' : 'rgba(0,212,255,0.25)';
+      dotCtx.fill();
+
+      // Middle glow
+      dotCtx.beginPath();
+      dotCtx.arc(64, 64, 36, 0, Math.PI * 2);
+      dotCtx.fillStyle = isSewer ? 'rgba(232,119,34,0.4)' : 'rgba(0,212,255,0.4)';
+      dotCtx.fill();
+
+      // Main circle
+      dotCtx.beginPath();
+      dotCtx.arc(64, 64, 28, 0, Math.PI * 2);
+      dotCtx.fillStyle = color;
+      dotCtx.fill();
+
+      // White border
+      dotCtx.strokeStyle = '#ffffff';
+      dotCtx.lineWidth = 5;
+      dotCtx.stroke();
+
+      // Inner highlight
+      dotCtx.beginPath();
+      dotCtx.arc(64, 64, 20, 0, Math.PI * 2);
+      dotCtx.fillStyle = isSewer ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.2)';
+      dotCtx.fill();
+
+      const dotTexture = new THREE.CanvasTexture(dotCanvas);
+      const dotMaterial = new THREE.SpriteMaterial({ 
+        map: dotTexture, 
+        transparent: true,
+        depthTest: false,
+        depthWrite: false
+      });
+      const dotSprite = new THREE.Sprite(dotMaterial);
+      dotSprite.position.set(pos.x, pos.y + 2.0, pos.z);
+      // Store original scale for zoom-relative resizing
+      dotSprite.userData = { 
+        type: 'manhole', 
+        index: i, 
+        manholeId: mh.id,
+        originalScale: new THREE.Vector3(10, 10, 1)
+      };
+      dotSprite.scale.copy(dotSprite.userData.originalScale);
+      dotSprite.name = `map_mh_${i}`;
+      dotSprite.visible = false;
+      dotSprite.renderOrder = 1000;
+      scene.add(dotSprite);
+      this.mapManholeSprites.push(dotSprite);
+
+      // Create label sprite
+      const labelCanvas = document.createElement('canvas');
+      const labelCtx = labelCanvas.getContext('2d');
+      labelCanvas.width = 256;
+      labelCanvas.height = 80;
+
+      // Strong text outline for legibility
+      labelCtx.font = 'bold 32px "Courier New", monospace';
+      labelCtx.textAlign = 'center';
+      labelCtx.textBaseline = 'middle';
+
+      // Multiple outline passes for maximum contrast
+      labelCtx.strokeStyle = '#0D1E35';
+      labelCtx.lineWidth = 8;
+      labelCtx.strokeText(mh.name, 128, 40);
+      labelCtx.strokeStyle = '#000000';
+      labelCtx.lineWidth = 5;
+      labelCtx.strokeText(mh.name, 128, 40);
+
+      // Main text
+      labelCtx.fillStyle = isSewer ? '#E87722' : '#00D4FF';
+      labelCtx.fillText(mh.name, 128, 40);
+
+      const labelTexture = new THREE.CanvasTexture(labelCanvas);
+      const labelMaterial = new THREE.SpriteMaterial({ 
+        map: labelTexture, 
+        transparent: true,
+        depthTest: false,
+        depthWrite: false
+      });
+      const labelSprite = new THREE.Sprite(labelMaterial);
+      labelSprite.position.set(pos.x, pos.y + 2.0, pos.z);
+      labelSprite.userData = {
+        originalScale: new THREE.Vector3(12, 3.75, 1)
+      };
+      labelSprite.scale.copy(labelSprite.userData.originalScale);
+      labelSprite.visible = false;
+      labelSprite.renderOrder = 1001;
+      scene.add(labelSprite);
+      this.mapManholeSprites.push(labelSprite);
+    });
+
+    // ── Pipe lines ──
+    pipes.forEach((p, i) => {
+      const fromMH = manholes.find(m => m.id === p.from_mh);
+      const toMH = manholes.find(m => m.id === p.to_mh);
+      if (!fromMH || !toMH) return;
+
+      const p1 = this.coordSystem.w2s(fromMH.x, fromMH.y, fromMH.cover_elev - p.from_depth);
+      const p2 = this.coordSystem.w2s(toMH.x, toMH.y, toMH.cover_elev - p.to_depth);
+
+      const isStormwater = (fromMH.type === 'Stormwater' || toMH.type === 'Stormwater');
+      const color = isStormwater ? 0x4A90D9 : 0xD4880F;
+
+      // Main pipe line — use TubeGeometry for visible thickness in 2D
+      const pipePath = new THREE.LineCurve3(p1, p2);
+      const tubeGeo = new THREE.TubeGeometry(pipePath, 1, 0.6, 6, false);
+      const tubeMat = new THREE.MeshBasicMaterial({
+        color: color,
+        transparent: true,
+        opacity: 0.85,
+        depthTest: false,
+        depthWrite: false
+      });
+      const tube = new THREE.Mesh(tubeGeo, tubeMat);
+      tube.visible = false;
+      tube.name = `map_pipe_${i}`;
+      tube.userData = { type: 'pipe', index: i };
+      tube.renderOrder = 500;
+      scene.add(tube);
+      this.mapPipeLines.push({ line: tube, index: i, p1, p2, isStormwater });
+
+      // Flow direction arrow (static triangle)
+      const mid = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+      const dir = new THREE.Vector3().subVectors(p2, p1).normalize();
+      const perp = new THREE.Vector3(-dir.z, 0, dir.x).normalize();
+
+      const fromInvert = fromMH.cover_elev - p.from_depth;
+      const toInvert = toMH.cover_elev - p.to_depth;
+      const flowDir = fromInvert >= toInvert ? dir : dir.clone().negate();
+
+      const arrowSize = 3.5;
+      // Build a proper indexed triangle so it renders filled from both sides
+      const tip   = mid.clone().add(flowDir.clone().multiplyScalar(arrowSize));
+      const left  = mid.clone().add(perp.clone().multiplyScalar(arrowSize * 0.4)).sub(flowDir.clone().multiplyScalar(arrowSize * 0.5));
+      const right = mid.clone().sub(perp.clone().multiplyScalar(arrowSize * 0.4)).sub(flowDir.clone().multiplyScalar(arrowSize * 0.5));
+
+      const arrowGeo = new THREE.BufferGeometry();
+      const positions = new Float32Array([
+        tip.x, tip.y, tip.z,
+        left.x, left.y, left.z,
+        right.x, right.y, right.z
+      ]);
+      arrowGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      arrowGeo.setIndex([0, 1, 2]);
+      arrowGeo.computeVertexNormals();
+
+      const arrowMat = new THREE.MeshBasicMaterial({
+        color: 0x00aaff,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.85
+      });
+      const arrowMesh = new THREE.Mesh(arrowGeo, arrowMat);
+      arrowMesh.visible = false;
+      arrowMesh.name = `map_flow_${i}`;
+      arrowMesh.renderOrder = 600;
+      scene.add(arrowMesh);
+      this.mapFlowArrows.push(arrowMesh);
+    });
+
+    // ── Highlight meshes (upstream/downstream) ──
+    // We'll create highlight lines that we can show/hide
+    this._createHighlightMeshes();
+  }
+
+  _createHighlightMeshes() {
+    const scene = this.sceneManager.scene;
+
+    // Upstream highlight material (green)
+    this.upstreamMat = new THREE.LineBasicMaterial({
+      color: 0x2ECC71,
+      linewidth: 5,
+      transparent: true,
+      opacity: 0.9,
+      depthTest: false,
+      depthWrite: false
+    });
+
+    // Downstream highlight material (red)
+    this.downstreamMat = new THREE.LineBasicMaterial({
+      color: 0xE74C3C,
+      linewidth: 5,
+      transparent: true,
+      opacity: 0.9,
+      depthTest: false,
+      depthWrite: false
+    });
+
+    // Manhole highlight (green ring)
+    this.upstreamMhMat = new THREE.MeshBasicMaterial({
+      color: 0x2ECC71,
+      transparent: true,
+      opacity: 0.6
+    });
+
+    // Manhole highlight (red ring)
+    this.downstreamMhMat = new THREE.MeshBasicMaterial({
+      color: 0xE74C3C,
+      transparent: true,
+      opacity: 0.6
+    });
+  }
+
+  _setupMapCamera(box) {
+    const centre = new THREE.Vector3();
+    box.getCenter(centre);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const span = Math.max(size.x, size.z) * 1.3;
+
+    // Orthographic camera for map view
+    const aspect = this.sceneManager.camera.aspect;
+    const frustumSize = span;
+
+    this.mapCamera = new THREE.OrthographicCamera(
+      frustumSize * aspect / -2,
+      frustumSize * aspect / 2,
+      frustumSize / 2,
+      frustumSize / -2,
+      0.1,
+      5000
+    );
+
+    this.mapCamera.position.set(centre.x, centre.y + span * 0.6, centre.z);
+    this.mapCamera.lookAt(centre);
+    this.mapCamera.up.set(0, 0, -1);
+
+    // Store for later
+    this.mapCameraTarget = centre.clone();
+    this.mapCameraZoom = span;
+  }
+
+  _toggleMapMode() {
+    this.mapMode = !this.mapMode;
+    const viewport = document.getElementById('viewport');
+    const toggleBtn = document.getElementById('view-mode-toggle');
+
+    if (this.mapMode) {
+      // Switch to Map View
+      this._enterMapView();
+      if (toggleBtn) toggleBtn.textContent = 'Switch to 3D View';
+      viewport.classList.add('map-mode');
+    } else {
+      // Switch to 3D View
+      this._enter3DView();
+      if (toggleBtn) toggleBtn.textContent = 'Switch to Map View';
+      viewport.classList.remove('map-mode');
+    }
+  }
+
+  _enterMapView() {
+    // Hide 3D objects
+    if (this.geometryBuilder.iCoversSewer) this.geometryBuilder.iCoversSewer.visible = false;
+    if (this.geometryBuilder.iCoversStorm) this.geometryBuilder.iCoversStorm.visible = false;
+    if (this.geometryBuilder.iShafts) this.geometryBuilder.iShafts.visible = false;
+
+    const stormPipe = this.sceneManager.scene.getObjectByName('pipes_storm');
+    const sewerPipe = this.sceneManager.scene.getObjectByName('pipes_sewer');
+    if (stormPipe) stormPipe.visible = false;
+    if (sewerPipe) sewerPipe.visible = false;
+
+    const droplines = this.sceneManager.scene.getObjectByName('droplines');
+    if (droplines) droplines.visible = false;
+
+    if (this.flowArrows?.mesh) this.flowArrows.mesh.visible = false;
+
+    // Show map objects
+    this.mapManholeSprites.forEach(s => s.visible = true);
+    this.mapPipeLines.forEach(p => p.line.visible = true);
+
+    const flowToggle = document.getElementById('flow-toggle');
+    const showFlow = flowToggle?.classList.contains('active');
+    this.mapFlowArrows.forEach(a => a.visible = showFlow);
+
+    // Switch camera
+    this.sceneManager.camera = this.mapCamera;
+    this.sceneManager.controls.object = this.mapCamera;
+
+    // Adjust controls for 2D
+    this.sceneManager.controls.maxPolarAngle = Math.PI * 0.001; // Lock to top-down
+    this.sceneManager.controls.minPolarAngle = 0;
+    this.sceneManager.controls.enableRotate = false;
+    this.sceneManager.controls.mouseButtons = {
+      LEFT: THREE.MOUSE.PAN,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.PAN
+    };
+
+    // Hide 3D-specific UI COMPLETELY
+    const controlPanel = document.getElementById('control-panel');
+    if (controlPanel) {
+      controlPanel.style.display = 'none';
+      controlPanel.classList.add('hidden');
+    }
+    document.getElementById('view-buttons')?.classList.add('hidden');
+    document.getElementById('data-toggle')?.classList.add('hidden');
+
+    // Show map-specific UI
+    const mapControls = document.getElementById('map-controls');
+    if (mapControls) {
+      mapControls.style.display = 'flex';
+      mapControls.classList.add('visible');
+    }
+
+    this.sceneManager.controls.update();
+  }
+
+  _enter3DView() {
+    // Show 3D objects
+    const layerMH = document.getElementById('layer-mh');
+    const layerPipes = document.getElementById('layer-pipes');
+
+    if (layerMH?.checked) {
+      if (this.geometryBuilder.iCoversSewer) this.geometryBuilder.iCoversSewer.visible = true;
+      if (this.geometryBuilder.iCoversStorm) this.geometryBuilder.iCoversStorm.visible = true;
+      if (this.geometryBuilder.iShafts) this.geometryBuilder.iShafts.visible = true;
+    }
+
+    if (layerPipes?.checked) {
+      const stormPipe = this.sceneManager.scene.getObjectByName('pipes_storm');
+      const sewerPipe = this.sceneManager.scene.getObjectByName('pipes_sewer');
+      if (stormPipe) stormPipe.visible = true;
+      if (sewerPipe) sewerPipe.visible = true;
+    }
+
+    // Hide map objects
+    this.mapManholeSprites.forEach(s => s.visible = false);
+    this.mapPipeLines.forEach(p => p.line.visible = false);
+    this.mapFlowArrows.forEach(a => a.visible = false);
+    this._clearMapHighlights();
+
+    // Switch camera back
+    this.sceneManager.camera = appState.camera;
+    this.sceneManager.controls.object = appState.camera;
+
+    // Restore 3D controls
+    this.sceneManager.controls.maxPolarAngle = Math.PI * 0.88;
+    this.sceneManager.controls.enableRotate = true;
+    this.sceneManager.controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.PAN
+    };
+
+    // Show 3D UI
+    const controlPanel = document.getElementById('control-panel');
+    if (controlPanel) {
+      controlPanel.style.display = '';
+      controlPanel.classList.remove('hidden');
+    }
+    document.getElementById('view-buttons')?.classList.remove('hidden');
+    document.getElementById('data-toggle')?.classList.remove('hidden');
+
+    // Hide map UI
+    const mapControls = document.getElementById('map-controls');
+    if (mapControls) {
+      mapControls.style.display = 'none';
+      mapControls.classList.remove('visible');
+    }
+
+    this.sceneManager.controls.update();
+  }
+
+  _clearMapHighlights() {
+    // Remove all highlight meshes
+    this.mapUpstreamHighlights.forEach(m => this.sceneManager.scene.remove(m));
+    this.mapDownstreamHighlights.forEach(m => this.sceneManager.scene.remove(m));
+    this.mapUpstreamHighlights = [];
+    this.mapDownstreamHighlights = [];
+  }
+
+  _highlightMapNetwork(manholeId) {
+    this._clearMapHighlights();
+
+    const upstream = this._traceUpstream(manholeId);
+    const downstream = this._traceDownstream(manholeId);
+
+    // ── UPSTREAM (GREEN) = Everything flowing INTO this manhole ──
+    upstream.pipeIndices.forEach(idx => {
+      const pipeData = this.mapPipeLines.find(p => p.index === idx);
+      if (pipeData) {
+        const path = new THREE.LineCurve3(pipeData.p1, pipeData.p2);
+        const geo = new THREE.TubeGeometry(path, 1, 1.2, 8, false);
+        const mat = this.upstreamMat.clone();
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.renderOrder = 200;
+        this.sceneManager.scene.add(mesh);
+        this.mapUpstreamHighlights.push(mesh);
+      }
+    });
+
+    upstream.manholeIds.forEach(id => {
+      if (id === manholeId) return; // Skip selected manhole (gets yellow ring)
+      const mhIdx = appState.mhInstData.findIndex(m => m.id === id);
+      if (mhIdx >= 0) {
+        const mh = appState.mhInstData[mhIdx];
+        const geo = new THREE.CircleGeometry(4.5, 16);
+        const mat = this.upstreamMhMat.clone();
+        mat.opacity = 0.5;
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.set(mh.topS.x, mh.topS.y + 2.5, mh.topS.z);
+        mesh.rotation.x = -Math.PI / 2;
+        mesh.renderOrder = 102;
+        this.sceneManager.scene.add(mesh);
+        this.mapUpstreamHighlights.push(mesh);
+      }
+    });
+
+    // ── DOWNSTREAM (RED) = Everything flowing OUT OF this manhole ──
+    downstream.pipeIndices.forEach(idx => {
+      const pipeData = this.mapPipeLines.find(p => p.index === idx);
+      if (pipeData) {
+        const path = new THREE.LineCurve3(pipeData.p1, pipeData.p2);
+        const geo = new THREE.TubeGeometry(path, 1, 1.2, 8, false);
+        const mat = this.downstreamMat.clone();
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.renderOrder = 200;
+        this.sceneManager.scene.add(mesh);
+        this.mapDownstreamHighlights.push(mesh);
+      }
+    });
+
+    downstream.manholeIds.forEach(id => {
+      if (id === manholeId) return; // Skip selected manhole
+      const mhIdx = appState.mhInstData.findIndex(m => m.id === id);
+      if (mhIdx >= 0) {
+        const mh = appState.mhInstData[mhIdx];
+        const geo = new THREE.CircleGeometry(4.5, 16);
+        const mat = this.downstreamMhMat.clone();
+        mat.opacity = 0.5;
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.set(mh.topS.x, mh.topS.y + 2.5, mh.topS.z);
+        mesh.rotation.x = -Math.PI / 2;
+        mesh.renderOrder = 102;
+        this.sceneManager.scene.add(mesh);
+        this.mapDownstreamHighlights.push(mesh);
+      }
+    });
+
+    // ── SELECTED MANHOLE gets a bright yellow ring ──
+    const selectedIdx = appState.mhInstData.findIndex(m => m.id === manholeId);
+    if (selectedIdx >= 0) {
+      const mh = appState.mhInstData[selectedIdx];
+      const geo = new THREE.RingGeometry(5.5, 7.5, 20);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xFFD700,
+        transparent: true,
+        opacity: 0.9,
+        side: THREE.DoubleSide,
+        depthTest: false,
+        depthWrite: false
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(mh.topS.x, mh.topS.y + 2.5, mh.topS.z);
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.renderOrder = 105;
+      this.sceneManager.scene.add(mesh);
+      this.mapUpstreamHighlights.push(mesh);
+    }
+  }
+
+  _setupViewToggle() {
+    // Add view toggle button to header
+    const header = document.getElementById('header');
+    const toggle = document.createElement('button');
+    toggle.id = 'view-mode-toggle';
+    toggle.className = 'view-mode-toggle';
+    toggle.textContent = 'Map View';
+    toggle.title = 'Toggle between Map and 3D view';
+
+    // Insert before stats label
+    const statsLabel = document.getElementById('stats-label');
+    if (statsLabel && header) {
+      header.insertBefore(toggle, statsLabel);
+    } else if (header) {
+      header.appendChild(toggle);
+    }
+
+    toggle.addEventListener('click', () => this._toggleMapMode());
+
+    // Add map controls panel
+    const mapControls = document.createElement('div');
+    mapControls.id = 'map-controls';
+    mapControls.innerHTML = `
+      <div class="map-search">
+        <input type="text" id="map-search-input" placeholder="Search manhole ID..." autocomplete="off">
+        <button id="map-search-btn">🔍</button>
+      </div>
+      <div class="map-legend">
+        <div class="map-legend-title">Legend</div>
+        <div class="map-legend-item">
+          <span class="map-dot sewer"></span>
+          <span>Sewer Manhole</span>
+        </div>
+        <div class="map-legend-item">
+          <span class="map-dot storm"></span>
+          <span>Stormwater Manhole</span>
+        </div>
+        <div class="map-legend-item">
+          <span class="map-line sewer"></span>
+          <span>Sewer Pipe</span>
+        </div>
+        <div class="map-legend-item">
+          <span class="map-line storm"></span>
+          <span>Stormwater Pipe</span>
+        </div>
+        <div class="map-legend-item">
+          <span class="map-arrow"></span>
+          <span>Flow Direction</span>
+        </div>
+        <div class="map-legend-item">
+          <span class="map-ring up"></span>
+          <span>Upstream Network</span>
+        </div>
+        <div class="map-legend-item">
+          <span class="map-ring down"></span>
+          <span>Downstream Network</span>
+        </div>
+      </div>
+      <div class="map-layers">
+        <div class="map-legend-title">Layers</div>
+        <label class="map-layer-item">
+          <input type="checkbox" id="map-layer-mh" checked>
+          <span>Manholes</span>
+        </label>
+        <label class="map-layer-item">
+          <input type="checkbox" id="map-layer-pipes" checked>
+          <span>Pipes</span>
+        </label>
+        <label class="map-layer-item">
+          <input type="checkbox" id="map-layer-flow" checked>
+          <span>Flow Arrows</span>
+        </label>
+        <label class="map-layer-item">
+          <input type="checkbox" id="map-layer-basemap" checked>
+          <span>Basemap</span>
+        </label>
+      </div>
+      <div class="map-hint">
+        <strong>Click a manhole</strong> to see details and trace upstream/downstream network.
+      </div>
+    `;
+    document.body.appendChild(mapControls);
+
+    // Map search functionality
+    const searchInput = document.getElementById('map-search-input');
+    const searchBtn = document.getElementById('map-search-btn');
+
+    const doSearch = () => {
+      const query = searchInput.value.trim().toUpperCase();
+      if (!query) return;
+
+      const result = this.searchIndex.findById(query);
+      if (result) {
+        this._flyToManholeMap(result.index);
+        this._selectMapManhole(result.index);
+      } else {
+        // Try partial match
+        const matches = this.searchIndex.search(query);
+        if (matches.length > 0) {
+          this._flyToManholeMap(matches[0].index);
+          this._selectMapManhole(matches[0].index);
+        }
+      }
+    };
+
+    searchBtn.addEventListener('click', doSearch);
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') doSearch();
+    });
+
+    // Map layer toggles
+    document.getElementById('map-layer-mh')?.addEventListener('change', (e) => {
+      this.mapManholeSprites.forEach(s => {
+        if (s.name?.startsWith('map_mh_')) s.visible = e.target.checked;
+      });
+    });
+
+    document.getElementById('map-layer-pipes')?.addEventListener('change', (e) => {
+      this.mapPipeLines.forEach(p => p.line.visible = e.target.checked);
+    });
+
+    document.getElementById('map-layer-flow')?.addEventListener('change', (e) => {
+      this.mapFlowArrows.forEach(a => a.visible = e.target.checked);
+    });
+
+    document.getElementById('map-layer-basemap')?.addEventListener('change', (e) => {
+      if (this.basemapMesh) this.basemapMesh.visible = e.target.checked;
+    });
+  }
+
+  _flyToManholeMap(index) {
+    const mh = appState.mhInstData[index];
+    if (!mh || !this.mapCamera) return;
+
+    const target = mh.topS.clone();
+    const currentPos = this.mapCamera.position.clone();
+    const startTarget = this.sceneManager.controls.target.clone();
+
+    // Animate camera
+    const startTime = performance.now();
+    const duration = 600;
+
+    const animate = (now) => {
+      const elapsed = now - startTime;
+      const t = Math.min(elapsed / duration, 1);
+      const ease = 1 - Math.pow(1 - t, 3);
+
+      this.mapCamera.position.lerpVectors(currentPos, new THREE.Vector3(target.x, currentPos.y, target.z), ease);
+      this.sceneManager.controls.target.lerpVectors(startTarget, target, ease);
+      this.sceneManager.controls.update();
+
+      if (t < 1) requestAnimationFrame(animate);
+    };
+
+    requestAnimationFrame(animate);
+  }
+
+  _selectMapManhole(index) {
+    const mh = appState.mhInstData[index];
+    if (!mh) return;
+
+    this.mapSelectedManhole = mh.id;
+    this._highlightMapNetwork(mh.id);
+
+    // Get trace counts for the popup
+    const upstream = this._traceUpstream(mh.id);
+    const downstream = this._traceDownstream(mh.id);
+
+    this.ui.renderManholePopup(mh, {
+      upstreamCount: upstream.manholeIds.size - 1, // exclude self
+      downstreamCount: downstream.manholeIds.size - 1,
+      upstreamPipeCount: upstream.pipeIndices.size,
+      downstreamPipeCount: downstream.pipeIndices.size
+    });
+  }
+
+  // ── Modified event handlers for map mode ──
+
+  _onViewportClick(event) {
+    if (appState.measureMode && !this.mapMode) {
+      this._onMeasureClick(event);
+      return;
+    }
+
+    if (this.mapMode) {
+      this._onMapClick(event);
+      return;
+    }
+
+    const result = this.raycaster.castRay(event);
+
+    if (!result) {
+      appState.clearSelection();
+      this.geometryBuilder.resetManholeColors();
+      this.geometryBuilder.clearPipeHighlight();
+      this.ui.hidePopup();
+      this.ui.hideProfile();
+      return;
+    }
+
+    appState.clearSelection();
+    this.ui.hidePopup();
+
+    const { type, idx } = result;
+
+    if (type === 'manhole') {
+      this._selectManhole(idx);
+    } else {
+      this._selectPipe(idx);
+    }
+  }
+
+  _onMapClick(event) {
+    const rect = this.sceneManager.renderer.domElement.getBoundingClientRect();
+    const mouse = new THREE.Vector2();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(mouse, this.mapCamera);
+
+    // Check manhole sprites
+    const manholeSprites = this.mapManholeSprites.filter(s => 
+      s.name?.startsWith('map_mh_') && s.visible
+    );
+
+    const intersects = raycaster.intersectObjects(manholeSprites);
+
+    if (intersects.length > 0) {
+      const sprite = intersects[0].object;
+      const index = sprite.userData.index;
+      this._selectMapManhole(index);
+    } else {
+      // Clicked empty space - clear selection
+      this._clearMapHighlights();
+      this.mapSelectedManhole = null;
+      this.ui.hidePopup();
+    }
+  }
+
+  _onViewportMouseMove(event) {
+    if (this.mapMode) {
+      const rect = this.sceneManager.renderer.domElement.getBoundingClientRect();
+      const mouse = new THREE.Vector2();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(mouse, this.mapCamera);
+
+      const manholeSprites = this.mapManholeSprites.filter(s => 
+        s.name?.startsWith('map_mh_') && s.visible
+      );
+
+      const intersects = raycaster.intersectObjects(manholeSprites);
+      document.getElementById('viewport').style.cursor = intersects.length > 0 ? 'pointer' : 'grab';
+      return;
+    }
+
+    const result = this.raycaster.castRay(event);
+    document.getElementById('viewport').style.cursor = result ? 'pointer' : 'default';
+  }
+
+  // ── Rest of existing methods (preserved) ──
 
   async _loadBasemap() {
     try {
@@ -139,8 +1018,6 @@ class NetworkViewerApp {
     return new Promise(resolve => requestAnimationFrame(resolve));
   }
 
-  /* ── Event Listeners ──────────────────────────────────────────── */
-
   _setupEventListeners() {
     const viewport = document.getElementById('viewport');
     viewport.addEventListener('click', this._onViewportClick);
@@ -155,12 +1032,10 @@ class NetworkViewerApp {
   }
 
   _setupUIControls() {
-    // View buttons
     document.querySelectorAll('.view-btn').forEach(btn => {
       btn.addEventListener('click', () => this._setCameraView(btn.dataset.view));
     });
 
-    // Layer controls
     this.ui.setupLayerControls({
       onManholeLayer: (visible) => {
         if (this.geometryBuilder.iCoversSewer) this.geometryBuilder.iCoversSewer.visible = visible;
@@ -181,7 +1056,6 @@ class NetworkViewerApp {
       }
     });
 
-    // Slider controls
     this.ui.setupSliderControls({
       onElevChange: (offset) => {
         if (this.basemapMesh) {
@@ -196,7 +1070,6 @@ class NetworkViewerApp {
       }
     });
 
-    // Measure button
     this.ui.elements.measureBtn?.addEventListener('click', () => {
       const newMode = !appState.measureMode;
       appState.setMeasureMode(newMode);
@@ -204,10 +1077,7 @@ class NetworkViewerApp {
     });
   }
 
-  /* ── Search & Data Table ──────────────────────────────────────── */
-
   _setupSearchAndTable() {
-    // Create data panel
     if (!document.getElementById('data-panel')) {
       const panel = document.createElement('div');
       panel.id = 'data-panel';
@@ -225,7 +1095,6 @@ class NetworkViewerApp {
       `;
       document.body.appendChild(panel);
 
-      // Toggle button
       const toggle = document.createElement('button');
       toggle.id = 'data-toggle';
       toggle.innerHTML = '☰';
@@ -234,7 +1103,6 @@ class NetworkViewerApp {
 
       toggle.addEventListener('click', () => this._toggleDataPanel());
 
-      // Filter buttons
       panel.querySelectorAll('.dt-filter-btn').forEach(btn => {
         btn.addEventListener('click', () => {
           panel.querySelectorAll('.dt-filter-btn').forEach(b => b.classList.remove('active'));
@@ -243,7 +1111,6 @@ class NetworkViewerApp {
         });
       });
 
-      // Search input with debounce
       const input = panel.querySelector('#dt-search-input');
       input.addEventListener('input', () => {
         clearTimeout(this._searchDebounceTimer);
@@ -262,7 +1129,6 @@ class NetworkViewerApp {
       });
     }
 
-    // Init table
     const tableContainer = document.getElementById('dt-table-container');
     if (tableContainer) {
       this.dataTable = new DataTable('dt-table-container', {
@@ -290,13 +1156,8 @@ class NetworkViewerApp {
     const activeFilter = document.querySelector('.dt-filter-btn.active');
     const type = activeFilter?.dataset.filter === 'all' ? null : activeFilter?.dataset.filter;
 
-    // ── ISOLATE NETWORK BY TYPE ──
-    // When Sewer selected: show only Sewer manholes + Sewer pipes
-    // When Stormwater selected: show only Stormwater manholes + Stormwater pipes
-    // When All: show everything
     this._isolateNetworkType(type);
 
-    // Apply text search to table only
     if (!query) {
       this.dataTable?.filter(type ? d => d.type === type : null);
     } else {
@@ -306,17 +1167,12 @@ class NetworkViewerApp {
     }
   }
 
-  /**
-   * Isolate network by type — hides all manholes/pipes of other types.
-   * @param {string|null} type — 'Sewer', 'Stormwater', or null (show all)
-   */
   _isolateNetworkType(type) {
     const showSewerMH = !type || type === 'Sewer';
     const showStormMH = !type || type === 'Stormwater';
     const showSewerPipe = !type || type === 'Sewer';
     const showStormPipe = !type || type === 'Stormwater';
 
-    // Manhole covers
     if (this.geometryBuilder.iCoversSewer) {
       this.geometryBuilder.iCoversSewer.visible = showSewerMH;
     }
@@ -324,27 +1180,19 @@ class NetworkViewerApp {
       this.geometryBuilder.iCoversStorm.visible = showStormMH;
     }
 
-    // Shafts — hide shafts of filtered-out manholes by rebuilding visibility mask
-    // Since shafts are one InstancedMesh, we use scale=0 to hide individual shafts
     this._setShaftVisibility(type);
 
-    // Pipes
     const stormPipe = this.sceneManager.scene.getObjectByName('pipes_storm');
     const sewerPipe = this.sceneManager.scene.getObjectByName('pipes_sewer');
     if (stormPipe) stormPipe.visible = showStormPipe;
     if (sewerPipe) sewerPipe.visible = showSewerPipe;
 
-    // Update layer checkboxes to reflect isolation
     const mhCheckbox = document.getElementById('layer-mh');
     const pipeCheckbox = document.getElementById('layer-pipes');
-    if (mhCheckbox) mhCheckbox.checked = true; // Always on, but filtered by type
+    if (mhCheckbox) mhCheckbox.checked = true;
     if (pipeCheckbox) pipeCheckbox.checked = true;
   }
 
-  /**
-   * Hide individual shafts by scaling them to zero.
-   * Since all shafts share one InstancedMesh, we scale filtered ones to 0.
-   */
   _setShaftVisibility(type) {
     if (!this.geometryBuilder.iShafts) return;
 
@@ -362,12 +1210,10 @@ class NetworkViewerApp {
       matrix.decompose(position, quaternion, scale);
 
       if (shouldShow) {
-        // Restore original scale (stored in mhInstData)
         dummy.position.copy(position);
         dummy.quaternion.copy(quaternion);
         dummy.scale.set(mh.r * 2, mh.h, mh.r * 2);
       } else {
-        // Scale to zero to hide
         dummy.position.copy(position);
         dummy.quaternion.copy(quaternion);
         dummy.scale.set(0, 0, 0);
@@ -380,24 +1226,33 @@ class NetworkViewerApp {
   }
 
   _setupFlowToggle() {
-    const btn = document.createElement('button');
-    btn.id = 'flow-toggle';
-    btn.textContent = 'Toggle Flow Direction';
-    btn.title = 'Toggle flow direction (F)';
-    document.body.appendChild(btn);
+    const btn = document.getElementById('flow-toggle');
+    if (!btn) {
+      const newBtn = document.createElement('button');
+      newBtn.id = 'flow-toggle';
+      newBtn.textContent = 'Toggle Flow Direction';
+      newBtn.title = 'Toggle flow direction (F)';
+      document.body.appendChild(newBtn);
 
-    btn.addEventListener('click', () => {
-      const on = this.flowArrows?.toggle();
-      btn.textContent = on ? 'Hide Flow Direction' : 'Toggle Flow Direction';
-      btn.classList.toggle('active', on);
-    });
+      newBtn.addEventListener('click', () => {
+        const on = this.flowArrows?.toggle();
+        // Also toggle map flow arrows
+        this.mapFlowArrows.forEach(a => a.visible = on);
+        newBtn.textContent = on ? 'Hide Flow Direction' : 'Toggle Flow Direction';
+        newBtn.classList.toggle('active', on);
+      });
+    } else {
+      btn.addEventListener('click', () => {
+        const on = this.flowArrows?.toggle();
+        this.mapFlowArrows.forEach(a => a.visible = on);
+        btn.textContent = on ? 'Hide Flow Direction' : 'Toggle Flow Direction';
+        btn.classList.toggle('active', on);
+      });
+    }
   }
-
-  /* ── Selection & Camera ───────────────────────────────────────── */
 
   _setupHelpModal() {
     this.helpModal = new HelpModal();
-    // Auto-show on first visit after a short delay
     setTimeout(() => this.helpModal.maybeAutoShow(), 1200);
   }
 
@@ -421,35 +1276,6 @@ class NetworkViewerApp {
 
     this.ui.renderManholePopup(mh);
     this.dataTable?.setSelectedIndex(index);
-  }
-
-  _onViewportClick(event) {
-    if (appState.measureMode) {
-      this._onMeasureClick(event);
-      return;
-    }
-
-    const result = this.raycaster.castRay(event);
-
-    if (!result) {
-      appState.clearSelection();
-      this.geometryBuilder.resetManholeColors();
-      this.geometryBuilder.clearPipeHighlight();
-      this.ui.hidePopup();
-      this.ui.hideProfile();
-      return;
-    }
-
-    appState.clearSelection();
-    this.ui.hidePopup();
-
-    const { type, idx } = result;
-
-    if (type === 'manhole') {
-      this._selectManhole(idx);
-    } else {
-      this._selectPipe(idx);
-    }
   }
 
   _selectManhole(idx) {
@@ -495,11 +1321,6 @@ class NetworkViewerApp {
     });
   }
 
-  _onViewportMouseMove(event) {
-    const result = this.raycaster.castRay(event);
-    document.getElementById('viewport').style.cursor = result ? 'pointer' : 'default';
-  }
-
   _onMeasureClick(event) {
     const targets = [this.groundObjects.plane, this.basemapMesh].filter(Boolean);
     const point = this.raycaster.castRayToGround(event, targets);
@@ -530,13 +1351,16 @@ class NetworkViewerApp {
       case '5': this._setCameraView('left'); break;
       case '6': this._setCameraView('back'); break;
       case 'm':
-        this.ui.elements.measureBtn?.click();
+        if (!this.mapMode) this.ui.elements.measureBtn?.click();
         break;
       case 'f':
         document.getElementById('flow-toggle')?.click();
         break;
       case 't':
-        this._toggleDataPanel();
+        if (!this.mapMode) this._toggleDataPanel();
+        break;
+      case 'v':
+        this._toggleMapMode();
         break;
       case '?':
         this.helpModal?.toggle();
@@ -548,6 +1372,10 @@ class NetworkViewerApp {
         appState.clearSelection();
         this.geometryBuilder.resetManholeColors();
         this.geometryBuilder.clearPipeHighlight();
+        if (this.mapMode) {
+          this._clearMapHighlights();
+          this.mapSelectedManhole = null;
+        }
         break;
     }
   }
@@ -563,21 +1391,63 @@ class NetworkViewerApp {
     this.ui.setActiveView(viewName);
   }
 
-  /* ── Animation Loop ───────────────────────────────────────────── */
-
   _animate() {
     requestAnimationFrame(this._animate);
     this.sceneManager.controls.update();
-    this.flowArrows?.update(this.sceneManager.camera);
 
-    const droplines = this.sceneManager.scene.getObjectByName('droplines');
-    if (droplines) {
-      const dist = this.sceneManager.camera.position.distanceTo(this.sceneManager.controls.target);
-      droplines.visible = dist < 300;
+    if (!this.mapMode) {
+      this.flowArrows?.update(this.sceneManager.camera);
+
+      const droplines = this.sceneManager.scene.getObjectByName('droplines');
+      if (droplines) {
+        const dist = this.sceneManager.camera.position.distanceTo(this.sceneManager.controls.target);
+        droplines.visible = dist < 300;
+      }
+    } else {
+      // In map mode: scale manhole sprites inversely with zoom to keep them from overlapping
+      this._updateMapSpriteScales();
     }
 
     this.sceneManager.render();
     this.ui.updateFPS();
+  }
+
+  /**
+   * Scale map manhole sprites based on orthographic camera zoom.
+   * As the view zooms out (frustum gets larger), sprites grow proportionally
+   * so they remain visible. As you zoom in (frustum gets smaller), sprites
+   * shrink so they don't overlap neighbouring manholes.
+   */
+  _updateMapSpriteScales() {
+    if (!this.mapCamera || !this.mapManholeSprites.length) return;
+
+    // Get the orthographic frustum size — this is our proxy for "zoom level"
+    // left/right are symmetric, so (right - left) is the full frustum width
+    const frustumWidth = this.mapCamera.right - this.mapCamera.left;
+    const frustumHeight = this.mapCamera.top - this.mapCamera.bottom;
+    const frustumSize = Math.max(frustumWidth, frustumHeight);
+
+    // Base frustum size when the camera was initially set up
+    const baseFrustum = this._mapBaseFrustum || frustumSize;
+    if (!this._mapBaseFrustum) this._mapBaseFrustum = baseFrustum;
+
+    // Scale factor: inverse of zoom — when frustum is larger (zoomed out),
+    // we want sprites to be larger in world units so they stay visible.
+    // When frustum is smaller (zoomed in), sprites shrink to avoid overlap.
+    const zoomFactor = frustumSize / baseFrustum;
+
+    // Clamp to reasonable bounds so sprites never get too tiny or huge
+    const clampedFactor = Math.max(0.4, Math.min(2.5, zoomFactor));
+
+    for (const sprite of this.mapManholeSprites) {
+      if (!sprite.visible || !sprite.userData.originalScale) continue;
+      const orig = sprite.userData.originalScale;
+      sprite.scale.set(
+        orig.x * clampedFactor,
+        orig.y * clampedFactor,
+        orig.z
+      );
+    }
   }
 
   _handleFatalError(error) {
