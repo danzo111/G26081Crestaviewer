@@ -43,21 +43,36 @@ export class FlowArrows {
       opacity: 0.95
     });
 
-    const validPipes = this.pipeData.filter(p => p && p.fromInvert !== undefined);
+    // Collect ALL valid pipes — ensure none are skipped
+    const validPipes = [];
+    for (let i = 0; i < this.pipeData.length; i++) {
+      const p = this.pipeData[i];
+      if (!p) continue;
+      // Accept any pipe that has valid endpoint data
+      if (!p.p1 || !p.p2) continue;
+      // fromInvert/toInvert might be 0 (valid) or undefined (invalid)
+      if (p.fromInvert === undefined || p.fromInvert === null) continue;
+      if (p.toInvert === undefined || p.toInvert === null) continue;
+      validPipes.push(p);
+    }
+
     const count = validPipes.length;
-    if (count === 0) return;
+    if (count === 0) {
+      console.warn('FlowArrows: no valid pipes found for flow arrows');
+      return;
+    }
+
+    console.log(`FlowArrows: creating ${count} arrows for ${this.pipeData.length} total pipes`);
 
     this.mesh = new THREE.InstancedMesh(coneGeo, material, count);
-    this.mesh.instanceMatrix = new THREE.InstancedBufferAttribute(new Float32Array(count * 16), 16);
     this.mesh.name = 'flow_arrows';
     this.mesh.visible = false;
-    this.mesh.renderOrder = 10; // Draw on top of pipes
+    this.mesh.renderOrder = 10;
 
     const dummy = new THREE.Object3D();
-    let instanceIdx = 0;
 
-    validPipes.forEach(pd => {
-      if (!pd) return;
+    for (let i = 0; i < validPipes.length; i++) {
+      const pd = validPipes[i];
 
       // Determine flow direction: from higher invert to lower invert
       const flowsFromP1 = pd.fromInvert >= pd.toInvert;
@@ -70,22 +85,16 @@ export class FlowArrows {
       // Position arrow at midpoint, slightly above pipe
       dummy.position.copy(mid).add(new THREE.Vector3(0, pd.rp * 2.5 + 0.4, 0));
 
-      // Orient arrow along flow direction (cone points +Y by default)
+      // Orient arrow along flow direction
       const up = new THREE.Vector3(0, 1, 0);
-      if (Math.abs(dir.dot(up)) > 0.999) {
-        dummy.quaternion.setFromUnitVectors(up, dir);
-      } else {
-        dummy.quaternion.setFromUnitVectors(up, dir);
-      }
+      dummy.quaternion.setFromUnitVectors(up, dir);
 
-      // Scale based on pipe size (larger pipes = larger arrows)
+      // Scale based on pipe size
       const scale = Math.min(2.0, Math.max(0.8, pd.rp * 10));
       dummy.scale.setScalar(scale);
       dummy.updateMatrix();
-      this.mesh.setMatrixAt(instanceIdx, dummy.matrix);
-
-      instanceIdx++;
-    });
+      this.mesh.setMatrixAt(i, dummy.matrix);
+    }
 
     this.mesh.instanceMatrix.needsUpdate = true;
     this.mesh.castShadow = false;
